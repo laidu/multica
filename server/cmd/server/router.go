@@ -59,6 +59,7 @@ var corsAllowedHeaders = []string{
 	"Accept",
 	"Authorization",
 	"Content-Type",
+	"Idempotency-Key",
 	"X-Workspace-ID",
 	"X-Workspace-Slug",
 	"X-Request-ID",
@@ -863,6 +864,21 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		slog.Info("vcs integration disabled (MULTICA_VCS_SECRET_KEY not set)")
 	}
 
+	// Remote MCP Plugin credentials use a dedicated deployment key. Keeping
+	// this separate from VCS and channel secrets gives operators an isolated
+	// rotation and blast radius; without it configuration endpoints fail closed.
+	if pluginKey, err := secretbox.LoadKey("MULTICA_PLUGIN_SECRET_KEY"); err == nil {
+		box, err := secretbox.New(pluginKey)
+		if err != nil {
+			slog.Error("plugins: secretbox.New failed; Remote MCP credentials disabled", "error", err)
+		} else if h.PluginService != nil {
+			h.PluginService.RemoteMCPSecrets = box
+			slog.Info("Remote MCP Plugin credential encryption enabled")
+		}
+	} else {
+		slog.Info("Remote MCP Plugin credentials disabled (MULTICA_PLUGIN_SECRET_KEY not set)")
+	}
+
 	if opts.HeartbeatScheduler != nil {
 		h.HeartbeatScheduler = opts.HeartbeatScheduler
 	}
@@ -1042,6 +1058,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// Auth group made a missing cookie a hard 401, breaking the flow for exactly
 	// the browsers above; the other four composio endpoints stay session-gated.
 	r.Get("/api/integrations/composio/callback", h.ComposioCallback)
+	// Generic hosted Remote MCP OAuth callback. Identity and installation scope
+	// come exclusively from the encrypted, single-use state record.
+	r.With(authVerifyRL).Get("/api/plugins/remote-mcp/oauth/callback", h.CompletePluginRemoteMCPOAuth)
 
 	// Daemon API routes (require daemon token or valid user token)
 	r.Route("/api/daemon", func(r chi.Router) {
@@ -1070,6 +1089,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/runtimes/{runtimeId}/local-skills/import/{requestId}/result", h.ReportLocalSkillImportResult)
 
 		r.Get("/tasks/{taskId}/status", h.GetTaskStatus)
+		r.Get("/tasks/{taskId}/remote-mcp/{contributionId}/credential", h.ResolveTaskRemoteMCPCredential)
 		r.Post("/tasks/{taskId}/start", h.StartTask)
 		r.Post("/tasks/{taskId}/wait-local-directory", h.MarkTaskWaitingLocalDirectory)
 		r.Post("/tasks/{taskId}/progress", h.ReportTaskProgress)
@@ -1159,7 +1179,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// are admin-gated below).
 					r.Get("/runtime-profiles", h.ListRuntimeProfiles)
 					r.Get("/runtime-profiles/{profileId}", h.GetRuntimeProfile)
+					// The workspace MCP library — member-visible so an agent
+					// owner can see what is available to add to their agent.
+					// The payload is names and transports only; the stored
+					// entries are write-only.
+					r.Get("/mcp-servers", h.ListWorkspaceMcpServers)
 					r.Get("/plugins", h.ListPlugins)
+					r.Get("/plugins/private", h.ListPrivatePlugins)
+					r.Get("/plugins/private/{pluginRef}", h.GetPrivatePluginStatus)
+					r.Get("/plugins/catalog", h.ListPluginCatalog)
+					r.Get("/plugins/catalog/{pluginKey}", h.GetPluginCatalogRelease)
 				})
 				// Admin-level access
 				r.Group(func(r chi.Router) {
@@ -1172,14 +1201,29 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 						r.Delete("/", h.DeleteMember)
 					})
 					r.Delete("/invitations/{invitationId}", h.RevokeInvitation)
+					// Curating the shared MCP library is an admin action.
+					// Creating an entry binds it to no agent; an agent owner
+					// adds it to their own agent through the agent routes.
+					r.Post("/mcp-servers", h.CreateWorkspaceMcpServer)
+					r.Put("/mcp-servers/{serverId}", h.UpdateWorkspaceMcpServer)
+					r.Delete("/mcp-servers/{serverId}", h.DeleteWorkspaceMcpServer)
 					// Custom runtime profile mutations (admin-only).
 					r.Post("/runtime-profiles", h.CreateRuntimeProfile)
 					r.Patch("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Put("/runtime-profiles/{profileId}", h.UpdateRuntimeProfile)
 					r.Delete("/runtime-profiles/{profileId}", h.DeleteRuntimeProfile)
+					r.Post("/plugins/install", h.InstallPlugin)
+					r.Post("/plugins/private/install", h.InstallPrivatePlugin)
+					r.Post("/plugins/{installationId}/upgrade", h.UpgradePlugin)
 					r.Post("/plugins/{installationId}/enable", h.EnablePlugin)
 					r.Post("/plugins/{installationId}/disable", h.DisablePlugin)
+					r.Put("/plugins/{installationId}/remote-mcp/{contributionKey}/config", h.ConfigurePluginRemoteMCP)
+					r.Post("/plugins/{installationId}/remote-mcp/{contributionKey}/oauth/start", h.StartPluginRemoteMCPOAuth)
+					r.Post("/plugins/{installationId}/remote-mcp/{contributionKey}/test", h.TestPluginRemoteMCP)
+					r.Post("/plugins/{installationId}/remote-mcp/{contributionKey}/approve", h.ReviewPluginRemoteMCPTools)
+					r.Delete("/plugins/{installationId}/remote-mcp/{contributionKey}/credential", h.RevokePluginRemoteMCPCredential)
 					r.Post("/plugins/{installationId}/rollback", h.RollbackPlugin)
+					r.Delete("/plugins/{installationId}", h.UninstallPlugin)
 				})
 				// Owner-only access
 				r.With(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner")).Delete("/", h.DeleteWorkspace)
@@ -1247,11 +1291,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Group(func(r chi.Router) {
 					r.Use(middleware.RequireWorkspaceMemberFromURL(queries, "id"))
 					r.Get("/dingtalk/installations", h.ListDingTalkInstallations)
+					r.Get("/dingtalk/group-routes", h.ListDingTalkGroupRoutes)
 				})
 				r.Group(func(r chi.Router) {
 					r.Use(middleware.RequireWorkspaceRoleFromURL(queries, "id", "owner", "admin"))
 					r.Delete("/dingtalk/installations/{installationId}", h.RevokeDingTalkInstallation)
 					r.Post("/dingtalk/install/byo", h.RegisterDingTalkBYO)
+					r.Patch("/dingtalk/group-routes/{routeId}", h.UpdateDingTalkGroupRoute)
 				})
 			})
 		})
@@ -1337,6 +1383,30 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Post("/checkout-sessions", h.CreateCloudBillingCheckoutSession)
 			r.Get("/checkout-sessions/{sessionId}", h.GetCloudBillingCheckoutSession)
 			r.Post("/portal-sessions", h.CreateCloudBillingPortalSession)
+		})
+
+		// Workspace subscriptions use the same cloud transport and Stripe
+		// webhook as the existing owner-credit billing surface, but every request
+		// is workspace-scoped. Entitlements, summary and prices are
+		// member-readable; Checkout, seat reconcile, and Portal mutations require
+		// owner/admin. The handlers also enforce
+		// billing_workspace_subscriptions so a route refactor cannot
+		// accidentally bypass the rollout flag.
+		r.Route("/api/cloud-subscriptions", func(r chi.Router) {
+			r.Use(handler.RequireHumanActor)
+
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RequireWorkspaceMember(queries))
+				r.Get("/entitlements", h.GetCloudWorkspaceEntitlements)
+				r.Get("/summary", h.GetCloudWorkspaceSubscriptionSummary)
+				r.Get("/prices", h.GetCloudWorkspaceSubscriptionPrices)
+			})
+			r.Group(func(r chi.Router) {
+				r.Use(middleware.RequireWorkspaceRole(queries, "owner", "admin"))
+				r.Post("/checkout-sessions", h.CreateCloudWorkspaceSubscriptionCheckout)
+				r.Post("/seats/reconcile", h.ReconcileCloudWorkspaceSubscriptionSeats)
+				r.Post("/portal-sessions", h.CreateCloudWorkspaceSubscriptionPortal)
+			})
 		})
 
 		// --- Workspace-scoped routes (all require workspace membership) ---
@@ -1563,6 +1633,14 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/skills/{skillId}/enabled", h.SetAgentSkillEnabled)
 					r.Put("/runtime-skills/enabled", h.SetAgentRuntimeSkillEnabled)
 					r.Delete("/skills/{skillId}", h.RemoveAgentSkill)
+					// Workspace MCP servers assigned to this agent. Mirrors
+					// the skills routes above: a library entry does nothing
+					// until it is added here, and the binding carries its own
+					// enabled toggle.
+					r.Get("/mcp-servers", h.ListAgentMcpServers)
+					r.Post("/mcp-servers", h.AddAgentMcpServer)
+					r.Put("/mcp-servers/{serverId}/enabled", h.SetAgentMcpServerEnabled)
+					r.Delete("/mcp-servers/{serverId}", h.RemoveAgentMcpServer)
 					// Dedicated env-management endpoint. Admits the agent
 					// owner or a workspace owner/admin; agent actors are
 					// denied. Every reveal / write is audited to
@@ -1595,6 +1673,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/", h.GetSkill)
 					r.Put("/", h.UpdateSkill)
 					r.Delete("/", h.DeleteSkill)
+					r.Post("/refresh", h.RefreshSkill)
 					r.Get("/labels", h.ListLabelsForSkill)
 					r.Post("/labels", h.AttachLabelToSkill)
 					r.Delete("/labels/{labelId}", h.DetachLabelFromSkill)

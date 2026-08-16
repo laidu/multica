@@ -47,6 +47,12 @@ import {
   SquadSchema,
   TimelineEntriesSchema,
   UserSchema,
+  EMPTY_PLUGIN_CATALOG,
+  PluginCatalogResponseSchema,
+  PluginInstallationSchema,
+  RemoteMCPDiscoveryResponseSchema,
+  RemoteMCPOAuthStartResponseSchema,
+  EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE,
 } from "./schemas";
 import { IssueViewSchema, IssueViewListSchema } from "./schemas";
 import { parseWithFallback } from "./schema";
@@ -1361,5 +1367,83 @@ describe("WeCom installation schemas", () => {
       { endpoint: "POST /api/wecom/binding/redeem" },
     );
     expect(redeem).toEqual(EMPTY_REDEEM_WECOM_BINDING_TOKEN_RESPONSE);
+  });
+});
+
+describe("Plugin catalog schemas", () => {
+  it("defaults optional release fields without granting trust or compatibility", () => {
+    const parsed = PluginCatalogResponseSchema.parse({
+      releases: [{ plugin_key: "ai.multica.software-delivery", version: "1.0.0" }],
+    });
+    expect(parsed.supported).toBe(true);
+    expect(parsed.releases[0]?.compatible).toBe(false);
+    expect(parsed.releases[0]?.signature_verified).toBe(false);
+    expect(parsed.releases[0]?.contributions).toEqual([]);
+  });
+
+  it("defaults missing lifecycle and binding fields to a disabled error state", () => {
+    const parsed = PluginInstallationSchema.parse({ id: "installation-1" });
+    expect(parsed.enabled).toBe(false);
+    expect(parsed.lifecycle_status).toBe("error");
+    expect(parsed.bindings).toEqual([]);
+    expect(parsed.trust_tier).toBe("");
+    expect(parsed.signature_verified).toBe(false);
+    expect(parsed.contribution_details).toEqual([]);
+    expect(parsed.remote_mcp).toEqual([]);
+  });
+
+  it("parses Remote MCP status without accepting secret-shaped response fields", () => {
+    const parsed = PluginInstallationSchema.parse({
+      id: "installation-1",
+      remote_mcp: [{
+        contribution_key: "search",
+        credential_state: "configured",
+        credential_hint: "••••1234",
+        credential: "must-not-be-modeled",
+        approved_tools: [{
+          name: "search.read",
+          input_schema: { type: "object" },
+          schema_digest: "sha256:fixture",
+          risk: "read",
+        }],
+        reviewed: true,
+        ready: true,
+      }],
+    });
+    expect(parsed.remote_mcp[0]?.credential_state).toBe("configured");
+    expect(parsed.remote_mcp[0]?.approved_tools[0]?.name).toBe("search.read");
+    expect(parsed.remote_mcp[0]?.ready).toBe(true);
+    expect(parsed.remote_mcp[0]).not.toHaveProperty("credential");
+  });
+
+  it("defaults a malformed Remote MCP discovery response without inventing tools", () => {
+    const fallback = { config_revision: 0, discovered_tools: [], discovered_schema_digest: "" };
+    const parsed = parseWithFallback(
+      { config_revision: "bad", discovered_tools: { name: "search" } },
+      RemoteMCPDiscoveryResponseSchema,
+      fallback,
+      { endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{key}/test" },
+    );
+    expect(parsed).toEqual(fallback);
+  });
+
+  it("rejects a malformed Remote MCP OAuth start response", () => {
+    expect(parseWithFallback(
+      { authorization_url: undefined },
+      RemoteMCPOAuthStartResponseSchema,
+      EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE,
+      { endpoint: "POST /api/workspaces/{id}/plugins/{installationId}/remote-mcp/{key}/oauth/start" },
+    )).toEqual(EMPTY_REMOTE_MCP_OAUTH_START_RESPONSE);
+    expect(RemoteMCPOAuthStartResponseSchema.parse({
+      authorization_url: "https://auth.example.test/authorize?state=opaque",
+    }).authorization_url).toContain("auth.example.test");
+  });
+
+  it("degrades a malformed catalog response to unsupported and empty", () => {
+    const parsed = parseWithFallback("not-json", PluginCatalogResponseSchema, EMPTY_PLUGIN_CATALOG, {
+      endpoint: "GET /api/workspaces/{id}/plugins/catalog",
+    });
+    expect(parsed).toEqual(EMPTY_PLUGIN_CATALOG);
+    expect(parsed.supported).toBe(false);
   });
 });

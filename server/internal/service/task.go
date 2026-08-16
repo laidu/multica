@@ -2303,6 +2303,14 @@ type CancelTaskOptions struct {
 	QueuedOnly          bool
 	ExpectedChatSession pgtype.UUID
 	QueueAction         string
+	// ErrorMessage / FailureReason, when set, are persisted onto the cancelled
+	// row. Only for cancellations the USER did not ask for (e.g. the worktree
+	// claim gate refusing a too-old daemon): a user-initiated cancel needs no
+	// explanation, but a server-initiated one without a persisted reason
+	// surfaces as an unexplained "cancelled" whose only trace is a 4xx in a
+	// daemon log the user never sees.
+	ErrorMessage  string
+	FailureReason string
 }
 
 // CancelTask cancels a single task by ID. It broadcasts a task:cancelled event
@@ -2315,6 +2323,24 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 	// synchronous restore anyway, and the durable path is the only one that can
 	// hand the prompt back at all.
 	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{ClientSupportsDraftRestore: true})
+	if err != nil {
+		return nil, err
+	}
+	return &result.Task, nil
+}
+
+// CancelTaskWithReason cancels a task the SERVER decided to stop, persisting an
+// actionable reason onto the row. It runs the same full cancellation flow as
+// CancelTask — audit capture, chat settle, agent status reconcile,
+// task:cancelled broadcast, NotifyTaskFinished — because a raw
+// CancelAgentTaskWithReason query bypass leaves the agent pill running, the
+// live card stale, and any capacity/serial waiter unwoken.
+func (s *TaskService) CancelTaskWithReason(ctx context.Context, taskID pgtype.UUID, errorMessage, failureReason string) (*db.AgentTaskQueue, error) {
+	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{
+		ClientSupportsDraftRestore: true,
+		ErrorMessage:               errorMessage,
+		FailureReason:              failureReason,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2359,7 +2385,19 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 			if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 				return err
 			}
-			cancelled, err := qtx.CancelAgentTask(ctx, taskID)
+			var (
+				cancelled db.AgentTaskQueue
+				err       error
+			)
+			if opts.ErrorMessage != "" || opts.FailureReason != "" {
+				cancelled, err = qtx.CancelAgentTaskWithReason(ctx, db.CancelAgentTaskWithReasonParams{
+					ID:            taskID,
+					Error:         pgtype.Text{String: opts.ErrorMessage, Valid: opts.ErrorMessage != ""},
+					FailureReason: pgtype.Text{String: opts.FailureReason, Valid: opts.FailureReason != ""},
+				})
+			} else {
+				cancelled, err = qtx.CancelAgentTask(ctx, taskID)
+			}
 			if err != nil {
 				return err
 			}
@@ -2700,6 +2738,27 @@ func (s *TaskService) finalizeCancelledChatMessage(ctx context.Context, task db.
 // atomic, so concurrent callers cannot finalize the same task twice and a
 // call with no pending marker is a no-op. The settled outcome is broadcast
 // as chat:cancel_finalized since the cancel HTTP response has long returned.
+// RebroadcastCancelledTask re-announces an already-cancelled task after a
+// post-terminal delivery landed on its row (the cancel-ack's branch name or
+// preserved-worktree error). The original task:cancelled broadcast fired at
+// cancel time, BEFORE the daemon's ack — clients may have refetched a row
+// without the delivery and will not refetch again on their own. Consumers
+// treat task:cancelled as idempotent cache invalidation, so a replay is safe.
+func (s *TaskService) RebroadcastCancelledTask(ctx context.Context, taskID pgtype.UUID) {
+	task, err := s.Queries.GetAgentTask(ctx, taskID)
+	if err != nil {
+		slog.Warn("rebroadcast cancelled task: load failed",
+			"task_id", util.UUIDToString(taskID), "error", err)
+		return
+	}
+	if task.Status != "cancelled" {
+		// A complete/fail callback already announced its own terminal event
+		// carrying the row's final fields; nothing stale to refresh.
+		return
+	}
+	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+}
+
 func (s *TaskService) FinalizeDeferredCancelledChat(ctx context.Context, taskID pgtype.UUID) {
 	var (
 		task    db.AgentTaskQueue
@@ -3079,10 +3138,11 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 	return claimed, nil
 }
 
-// FinalizeTaskClaim atomically persists the task-scoped token and, for a
+// FinalizeTaskClaim atomically persists the task-scoped agent token, an
+// optional short-lived daemon token used by the Remote MCP broker, and, for a
 // comment-backed task, the exact comment ids embedded in the response. The
 // handler must call this only after the full payload has been built and before
-// writing any response bytes. A failure rolls both writes back so the claim can
+// writing any response bytes. A failure rolls every write back so the claim can
 // be safely returned to the queue.
 func (s *TaskService) FinalizeTaskClaim(
 	ctx context.Context,
@@ -3090,11 +3150,25 @@ func (s *TaskService) FinalizeTaskClaim(
 	token db.CreateTaskTokenParams,
 	deliveredCommentIDs []pgtype.UUID,
 	recordCommentReceipt bool,
+	daemonTokens ...db.CreateDaemonTokenParams,
 ) ([]pgtype.UUID, error) {
+	if len(daemonTokens) > 1 {
+		return nil, fmt.Errorf("finalize task claim: expected at most one daemon token, got %d", len(daemonTokens))
+	}
 	receipt := task.DeliveredCommentIds
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if _, err := qtx.CreateTaskToken(ctx, token); err != nil {
 			return fmt.Errorf("create task token: %w", err)
+		}
+		if len(daemonTokens) == 1 {
+			// Opportunistic bounded cleanup keeps short-lived per-task daemon
+			// credentials from accumulating without adding another sweeper.
+			if err := qtx.DeleteExpiredDaemonTokens(ctx); err != nil {
+				return fmt.Errorf("delete expired daemon tokens: %w", err)
+			}
+			if _, err := qtx.CreateDaemonToken(ctx, daemonTokens[0]); err != nil {
+				return fmt.Errorf("create remote MCP daemon token: %w", err)
+			}
 		}
 		if !recordCommentReceipt {
 			return nil
@@ -3481,7 +3555,7 @@ func (s *TaskService) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID 
 // queued chat message could be claimed in the window between the task
 // flipping to 'completed' and chat_session.session_id being refreshed,
 // causing the new task to resume against a stale (or NULL) session.
-func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
+func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
 	var task db.AgentTaskQueue
 	// chatAssistantMsg is the single assistant outcome row written for a chat
 	// task inside the completion transaction below. It is broadcast (chat:done)
@@ -3496,6 +3570,7 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 			Result:                result,
 			SessionID:             pgtype.Text{String: sessionID, Valid: sessionID != ""},
 			WorkDir:               pgtype.Text{String: workDir, Valid: workDir != ""},
+			BranchName:            pgtype.Text{String: branchName, Valid: branchName != ""},
 			SessionRolloutMissing: sessionRolloutMissing,
 			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
 		})
@@ -3885,7 +3960,7 @@ func (s *TaskService) observeChatOutputLocalPath(task db.AgentTaskQueue, body st
 // coarse bucket. Daemon callers that already produced a refined reason
 // (via classifyPoisonedError, the timeout / runtime classifier, etc.)
 // will have their value preserved untouched.
-func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, failureReason string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
+func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
 	// MUL-2946: synthesise a refined reason from the error text whenever the
 	// caller didn't supply one. This is the last write-path guard against
 	// "agent_error" coarse rows ending up in agent_task_queue.failure_reason
@@ -3954,11 +4029,16 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 			return err
 		}
 		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
-			ID:                    taskID,
-			Error:                 pgtype.Text{String: errMsg, Valid: true},
-			FailureReason:         pgtype.Text{String: failureReason, Valid: failureReason != ""},
-			SessionID:             pgtype.Text{String: sessionID, Valid: sessionID != ""},
-			WorkDir:               pgtype.Text{String: workDir, Valid: workDir != ""},
+			ID:            taskID,
+			Error:         pgtype.Text{String: errMsg, Valid: true},
+			FailureReason: pgtype.Text{String: failureReason, Valid: failureReason != ""},
+			SessionID:     pgtype.Text{String: sessionID, Valid: sessionID != ""},
+			WorkDir:       pgtype.Text{String: workDir, Valid: workDir != ""},
+			// A failed run can still have produced a branch: worktree mode
+			// commits whatever the agent left before tearing the worktree down,
+			// precisely so partial work survives. Dropping the name here would
+			// leave that commit with no pointer to it.
+			BranchName:            pgtype.Text{String: branchName, Valid: branchName != ""},
 			SessionRolloutMissing: sessionRolloutMissing,
 			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
 		})
@@ -4837,6 +4917,7 @@ type PluginExecutionManifestData struct {
 	ComposerVersion      string                        `json:"composer_version"`
 	SchemaVersion        int32                         `json:"schema_version"`
 	OrderedContributions []pluginruntime.CompiledEntry `json:"ordered_contributions"`
+	Diagnostics          []string                      `json:"diagnostics,omitempty"`
 }
 
 // LoadTaskPluginSkillBundles resolves only the immutable artifact files named
@@ -4867,35 +4948,62 @@ func (s *TaskService) LoadTaskPluginSkillBundles(ctx context.Context, taskID pgt
 	if len(entries) == 0 {
 		return nil, nil, data, nil
 	}
+	artifactFileIDs := make([]pgtype.UUID, 0)
+	seenArtifactFileIDs := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.ContributionType != plugincontract.ContributionAgentSkillV1 {
+			continue
+		}
+		ids := make([]string, 0, len(entry.SkillFiles)+1)
+		ids = append(ids, entry.ArtifactFileID)
+		for _, file := range entry.SkillFiles {
+			ids = append(ids, file.ArtifactFileID)
+		}
+		for _, id := range ids {
+			if _, exists := seenArtifactFileIDs[id]; exists {
+				continue
+			}
+			parsed, parseErr := util.ParseUUID(id)
+			if parseErr != nil {
+				return nil, nil, nil, fmt.Errorf("execution manifest contains invalid artifact file id")
+			}
+			seenArtifactFileIDs[id] = struct{}{}
+			artifactFileIDs = append(artifactFileIDs, parsed)
+		}
+	}
+	artifactFilesByID := make(map[string]db.PluginArtifactFile, len(artifactFileIDs))
+	if len(artifactFileIDs) > 0 {
+		artifactFiles, listErr := s.Queries.ListPluginArtifactFilesByIDs(ctx, artifactFileIDs)
+		if listErr != nil {
+			return nil, nil, nil, fmt.Errorf("load pinned plugin Skill artifacts: %w", listErr)
+		}
+		for _, file := range artifactFiles {
+			artifactFilesByID[util.UUIDToString(file.ID)] = file
+		}
+	}
 
 	skills := make([]AgentSkillData, 0, len(entries))
+	skillEntries := make([]pluginruntime.CompiledEntry, 0, len(entries))
 	for _, entry := range entries {
+		if entry.ContributionType == plugincontract.ContributionRemoteMCPV1 {
+			if entry.ConfigID == "" || entry.ConfigRevision <= 0 || entry.Endpoint == "" || len(entry.ApprovedTools) == 0 || entry.ToolSchemaDigest == "" {
+				return nil, nil, nil, fmt.Errorf("execution manifest contains invalid remote MCP contribution")
+			}
+			continue
+		}
 		if entry.ContributionType != plugincontract.ContributionAgentSkillV1 || entry.ArtifactFileID == "" {
 			return nil, nil, nil, fmt.Errorf("execution manifest contains unsupported plugin contribution")
 		}
-		artifactFileID, parseErr := util.ParseUUID(entry.ArtifactFileID)
-		if parseErr != nil {
-			return nil, nil, nil, fmt.Errorf("execution manifest contains invalid artifact file id")
+		skill, materializeErr := materializePinnedPluginSkill(entry, artifactFilesByID)
+		if materializeErr != nil {
+			return nil, nil, nil, materializeErr
 		}
-		artifact, getErr := s.Queries.GetPluginArtifactFile(ctx, artifactFileID)
-		if getErr != nil {
-			return nil, nil, nil, fmt.Errorf("load pinned plugin artifact: %w", getErr)
-		}
-		releaseID, parseErr := util.ParseUUID(entry.ReleaseID)
-		if parseErr != nil || artifact.ReleaseID != releaseID || artifact.Path != entry.EntryPath || artifact.Digest != entry.EntryDigest || plugincontract.DigestBytes([]byte(artifact.Content)) != entry.EntryDigest {
-			return nil, nil, nil, fmt.Errorf("pinned plugin artifact failed digest validation")
-		}
-		skills = append(skills, AgentSkillData{
-			ID:          "plugin:" + entry.ContributionID,
-			Source:      skillbundle.SourcePlugin,
-			Name:        entry.ContributionKey,
-			Description: entry.Description,
-			Content:     artifact.Content,
-		})
+		skills = append(skills, skill)
+		skillEntries = append(skillEntries, entry)
 	}
 	bundles, refs := BuildAgentSkillBundles(skills)
 	for i := range refs {
-		if refs[i].Hash != entries[i].SkillBundleHash || refs[i].SizeBytes != entries[i].SkillSizeBytes || refs[i].FileCount != entries[i].SkillFileCount {
+		if refs[i].Hash != skillEntries[i].SkillBundleHash || refs[i].SizeBytes != skillEntries[i].SkillSizeBytes || refs[i].FileCount != skillEntries[i].SkillFileCount {
 			return nil, nil, nil, fmt.Errorf("pinned plugin skill bundle failed manifest validation")
 		}
 	}
